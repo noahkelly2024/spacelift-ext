@@ -5,31 +5,44 @@ const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 let creatingOffscreenPromise = null; // To prevent concurrent creation attempts
 
 async function hasOffscreenDocument() {
-    if (!chrome.offscreen) { // Guard for environments where offscreen might not be available
-        console.warn("Background: chrome.offscreen API not available.");
-        return false;
+    // Correct way to check for existing offscreen documents
+    if (chrome.runtime.getContexts) {
+        const contexts = await chrome.runtime.getContexts({
+            contextTypes: ['OFFSCREEN_DOCUMENT'],
+            documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH)]
+        });
+        return contexts && contexts.length > 0;
     }
-    const contexts = await chrome.offscreen.getContexts({ // Replaced deprecated getContexts
-        contextTypes: ['OFFSCREEN_DOCUMENT'],
-        documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH)]
-    });
-    return contexts && contexts.length > 0;
+    // Fallback if getContexts is somehow not available (shouldn't happen in MV3)
+    console.warn("Background: chrome.runtime.getContexts API not available. Offscreen document check might be unreliable.");
+    return false; // Or attempt another method if absolutely necessary, but getContexts is standard.
 }
-
 
 async function closeOffscreenDocument() {
-    if (!chrome.offscreen) return; // Guard
-    if (await hasOffscreenDocument()) {
-        console.log("Background: Closing existing offscreen document.");
-        try {
+    if (!chrome.offscreen) {
+        console.warn("Background: chrome.offscreen API not available for closing.");
+        return;
+    }
+    // No need to check with getContexts before calling closeDocument,
+    // as closeDocument itself handles the case where no document exists.
+    // It will reject its promise if no document is open or if another error occurs.
+    try {
+        // Check if a document MIGHT be open using our hasOffscreenDocument logic before attempting to close
+        // This is slightly more robust to avoid an error if it's already closed by other means.
+        if (await hasOffscreenDocument()) {
+            console.log("Background: Attempting to close existing offscreen document.");
             await chrome.offscreen.closeDocument();
-        } catch (e) {
-            console.warn("Background: Error during closeDocument (it might have auto-closed or already been closing):", e.message);
+            console.log("Background: closeDocument call completed.");
+        } else {
+            console.log("Background: No active offscreen document found to close.");
         }
-    } else {
-        console.log("Background: No active offscreen document to close.");
+    } catch (e) {
+        // This catch is important because closeDocument() can reject if no document exists.
+        // We don't want this to be an unhandled rejection if we're just trying to be thorough.
+        console.warn("Background: Error or warning during closeDocument (e.g., no document to close, or it was closing):", e.message);
     }
 }
+
 
 async function setupOffscreenDocumentForClipboard() {
     if (!chrome.offscreen) {
@@ -37,18 +50,34 @@ async function setupOffscreenDocumentForClipboard() {
     }
 
     // Attempt to close any existing document to ensure freshness
-    await closeOffscreenDocument();
+    // This is an aggressive strategy.
+    console.log("Background: Ensuring any previous offscreen document is closed before creating a new one.");
+    await closeOffscreenDocument(); // closeOffscreenDocument now handles cases where no doc exists
 
-    // Check if creation is already in progress (e.g., rapid clicks)
+    // After attempting to close, let's verify if it's truly gone or if another is being created.
+    // This helps manage concurrent calls.
     if (creatingOffscreenPromise) {
         console.log("Background: Offscreen document creation already in progress by another call. Awaiting its completion.");
         await creatingOffscreenPromise;
-        // After awaiting, the document should exist, so we can return.
-        // We assume the other call will set it up correctly.
-        // Or, if we want each call to ensure ITS document, this logic might need adjustment,
-        // but for now, let's avoid race conditions on createDocument.
+        // If we awaited, the document should now exist (or creation failed).
+        // Check one last time if it actually exists now, as the other call might have failed.
+        if (await hasOffscreenDocument()) {
+            console.log("Background: Offscreen document created by concurrent call is now ready.");
+            return;
+        } else {
+            console.warn("Background: Concurrent offscreen creation seems to have failed. Will attempt to create now.");
+            // Fall through to create it in this call if the concurrent one failed.
+        }
+    }
+
+    // Double-check if a document exists *now* before trying to create one.
+    // This handles the case where a concurrent setupOffscreenDocument completed successfully
+    // while this instance was waiting for closeOffscreenDocument.
+    if (await hasOffscreenDocument()) {
+        console.log("Background: Offscreen document already exists (possibly created by a concurrent call). No need to create again.");
         return;
     }
+
 
     console.log("Background: Creating a new offscreen document for clipboard operation.");
     creatingOffscreenPromise = chrome.offscreen.createDocument({
@@ -62,11 +91,11 @@ async function setupOffscreenDocumentForClipboard() {
         console.log("Background: New offscreen document created successfully.");
     } catch (error) {
         console.error("Background: Error creating new offscreen document:", error);
-        creatingOffscreenPromise = null; // Reset promise on failure
-        throw error; // Re-throw to be caught by the caller
+        // No need to set creatingOffscreenPromise to null here, finally block handles it.
+        throw error;
     } finally {
         // Important: Reset promise whether it succeeded or failed,
-        // so subsequent calls can attempt creation again.
+        // so subsequent calls can attempt creation again or know it's done.
         creatingOffscreenPromise = null;
     }
 }
@@ -102,13 +131,15 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 // --- Message Listener (from content script or offscreen) ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    console.log("Background: Received message:", request.action, "from", sender.tab ? `tab ${sender.tab.id}` : "extension context (e.g. offscreen)");
+    const source = sender.tab ? `tab ${sender.tab.id}` : (sender.documentId ? `offscreen (documentId: ${sender.documentId})` : "extension context");
+    console.log(`Background: Received message: '${request.action}' from ${source}`);
+
 
     if (request.action === "captureArea") {
         if (!sender.tab) {
             console.error("Background: 'captureArea' message received without sender.tab. This is unexpected.");
             sendResponse({ success: false, error: "Background: Internal error - missing tab context." });
-            return false; // No async from this path
+            return false;
         }
 
         (async () => {
@@ -131,7 +162,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     coords: request.coords
                 });
 
-                if (chrome.runtime.lastError) {
+                if (chrome.runtime.lastError) { // This checks for errors in sending the message itself or if port closed.
                     throw new Error(`Error messaging offscreen: ${chrome.runtime.lastError.message}`);
                 }
 
@@ -143,7 +174,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         message: 'The selected area has been copied to your clipboard.'
                     });
                     sendResponse({ success: true });
-                } else {
+                } else { // This handles errors reported *by* the offscreen document's logic.
                     const errorMsg = offscreenResponse?.error || 'Unknown error from screenshot processing service.';
                     console.error("Background: Offscreen document reported failure:", errorMsg);
                     chrome.notifications.create({
@@ -153,7 +184,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     sendResponse({ success: false, error: errorMsg });
                 }
 
-            } catch (error) {
+            } catch (error) { // This catches errors from setupOffscreen, captureVisibleTab, or unhandled promise rejections.
                 console.error("Background: Error during captureArea flow:", error.message, error);
                 chrome.notifications.create({
                     type: 'basic', iconUrl: 'icons/icon48.png',
@@ -167,8 +198,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true; // ESSENTIAL: Indicates sendResponse will be called asynchronously.
     }
 
-    console.warn("Background: Received unhandled message action:", request.action);
-    return false; // For unhandled actions, assuming no async response.
+    console.warn(`Background: Received unhandled message action: '${request.action}'`);
+    // If you don't intend to send a response for other actions, return false or nothing.
+    return false;
 });
 
-console.log("Background script loaded and listeners attached.");
+console.log("Background script loaded and listeners attached. Version with runtime.getContexts fix.");
